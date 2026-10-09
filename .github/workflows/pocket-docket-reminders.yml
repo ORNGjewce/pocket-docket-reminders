@@ -44,7 +44,7 @@ jobs:
       - name: Run reminders
         run: node send-reminders.mjs
         env:
-          DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.live_send != true }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.live_send != true }}
           VAPID_PUBLIC_KEY: ${{ secrets.VAPID_PUBLIC_KEY }}
           VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
           VAPID_SUBJECT: ${{ secrets.VAPID_SUBJECT }}

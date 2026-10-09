@@ -1,5 +1,5 @@
+﻿import { createECDH } from 'node:crypto';
 
-import { createECDH } from 'node:crypto';
 import admin from 'firebase-admin';
 import webpush from 'web-push';
 
@@ -112,3 +112,4 @@ try {
   console.error('Push service reason:', reason);
   process.exitCode = 1;
 }
+

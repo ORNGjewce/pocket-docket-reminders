@@ -36,5 +36,19 @@ jobs:
       - name: Install dependencies
         run: npm install --omit=dev
 
+      
+      - name: Check Google Cloud authentication
+        run: |
+          echo "Expected service account: ${{ vars.GCP_SERVICE_ACCOUNT }}"
+          echo "Expected project: pocket-docket-82820"
+          echo "Credential file present:"
+          if [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+            echo "Yes"
+          else
+            echo "No"
+            exit 1
+          fi
+
       - name: Test Firestore connection
         run: node test-firebase.mjs
+

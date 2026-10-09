@@ -1,0 +1,12 @@
+{
+  "name": "pocket-docket-push-scheduler",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "run": "node send-reminders.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.4.0",
+    "web-push": "^3.6.7"
+  }
+}

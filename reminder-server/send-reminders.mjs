@@ -2,15 +2,17 @@ import admin from 'firebase-admin';
 import webpush from 'web-push';
 import crypto from 'node:crypto';
 
-const ZONE = 'America/New_York';
+const DEFAULT_ZONE = 'America/New_York';
+const VALID_ZONES = new Set(['America/New_York','America/Chicago','America/Denver','America/Los_Angeles','America/Phoenix','America/Anchorage','Pacific/Honolulu']);
+const formatters = new Map();
+function formatter(zone){if(!formatters.has(zone))formatters.set(zone,new Intl.DateTimeFormat('en-CA',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}));return formatters.get(zone);}
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 const NOW = Date.now();
 const LOOKBACK_MS = 12 * 60_000;
 const LOOKAHEAD_MS = 60_000;
 const LEASE_MS = 3 * 60_000;
-const fmt = new Intl.DateTimeFormat('en-CA', {timeZone: ZONE, year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
-function parts(ms){return Object.fromEntries(fmt.formatToParts(new Date(ms)).filter(x=>x.type!=='literal').map(x=>[x.type,Number(x.value)]));}
-function localDate(ms){const p=parts(ms);return `${p.year}-${String(p.month).padStart(2,'0')}-${String(p.day).padStart(2,'0')}`;}
+function parts(ms,zone){return Object.fromEntries(formatter(zone).formatToParts(new Date(ms)).filter(x=>x.type!=='literal').map(x=>[x.type,Number(x.value)]));}
+function localDate(ms,zone){const p=parts(ms,zone);return `${p.year}-${String(p.month).padStart(2,'0')}-${String(p.day).padStart(2,'0')}`;}
 function dateAt(k){return new Date(`${k}T12:00:00Z`);}
 function addDays(k,n){const d=dateAt(k);d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);}
 function occurs(e,k){
@@ -28,13 +30,13 @@ function occurs(e,k){
 }
 // Find real UTC instants matching a New York wall-clock time. DST gaps yield none;
 // fall-back ambiguous times use the first occurrence, to avoid double reminders.
-function instant(k,time){
+function instant(k,time,zone){
  const [h,m]=time.split(':').map(Number);if(!/^\d{2}:\d{2}$/.test(time)||h>23||m>59)return null;
  const nominal=Date.parse(`${k}T${time}:00Z`);if(!Number.isFinite(nominal))return null;
  const matches=[];
- for(let offset=-5;offset<=5;offset++){
-   const t=nominal+offset*3600_000,p=parts(t);
-   if(localDate(t)===k&&p.hour===h&&p.minute===m)matches.push(t);
+ for(let offset=-12;offset<=12;offset++){
+   const t=nominal+offset*3600_000,p=parts(t,zone);
+   if(localDate(t,zone)===k&&p.hour===h&&p.minute===m)matches.push(t);
  }
  return matches.length?Math.min(...matches):null;
 }
@@ -49,21 +51,29 @@ admin.initializeApp({credential:admin.credential.applicationDefault(),projectId:
 const db=admin.firestore();
 const subscriptions=await db.collection('pushSubscriptions').where('enabled','==',true).get();
 const householdCache=new Map();
+const zoneCache=new Map();
 let dueCount=0,sent=0,failed=0,skipped=0;
 for(const subDoc of subscriptions.docs){
  const sub=subDoc.data();if(!sub.subscription?.endpoint||!sub.uid||!sub.householdId){skipped++;continue;}
  const memberDoc=await db.doc(`households/${sub.householdId}/members/${sub.uid}`).get();
  if(!memberDoc.exists){skipped++;continue;}
  if(!householdCache.has(sub.householdId))householdCache.set(sub.householdId,await db.collection('households').doc(sub.householdId).collection('events').get());
+ if(!zoneCache.has(sub.householdId)){
+   const householdDoc=await db.doc(`households/${sub.householdId}`).get();
+   const configured=householdDoc.data()?.timezone;
+   if(configured&&!VALID_ZONES.has(configured)){console.warn(`Invalid timezone for household ${sub.householdId}; skipping reminders`);zoneCache.set(sub.householdId,null);}
+   else zoneCache.set(sub.householdId,configured||DEFAULT_ZONE);
+ }
+ const zone=zoneCache.get(sub.householdId);if(!zone){skipped++;continue;}
  const ids=recipientIds(memberDoc.data(),sub.uid);
  for(const eventDoc of householdCache.get(sub.householdId).docs){
   const e=eventDoc.data();if(!eligible(e,ids)||!e.time||!e.date)continue;
   const offsets=reminders(e);if(!offsets.length)continue;
   // A reminder may fall up to seven days before the event.
-  const today=localDate(NOW);
+  const today=localDate(NOW,zone);
   for(let d= -1;d<=8;d++){
    const day=addDays(today,d);if(!occurs(e,day))continue;
-   const start=instant(day,String(e.time));if(start===null)continue;
+   const start=instant(day,String(e.time),zone);if(start===null)continue;
    for(const offset of new Set(offsets)){
     const due=start-offset*60_000;
     if(due>NOW+LOOKAHEAD_MS||due<NOW-LOOKBACK_MS)continue;

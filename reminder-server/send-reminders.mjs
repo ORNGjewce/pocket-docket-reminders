@@ -1,207 +1,92 @@
-
 import admin from 'firebase-admin';
 import webpush from 'web-push';
 import crypto from 'node:crypto';
 
-// Check that the required notification secrets are available.
-const required = [
-  'VAPID_PUBLIC_KEY',
-  'VAPID_PRIVATE_KEY',
-  'VAPID_SUBJECT'
-];
-
-for (const key of required) {
-  if (!process.env[key]) {
-    throw new Error('Missing secret ' + key);
-  }
+const ZONE = 'America/New_York';
+const DRY_RUN = process.env.DRY_RUN !== 'false';
+const NOW = Date.now();
+const LOOKBACK_MS = 12 * 60_000;
+const LOOKAHEAD_MS = 60_000;
+const LEASE_MS = 3 * 60_000;
+const fmt = new Intl.DateTimeFormat('en-CA', {timeZone: ZONE, year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
+function parts(ms){return Object.fromEntries(fmt.formatToParts(new Date(ms)).filter(x=>x.type!=='literal').map(x=>[x.type,Number(x.value)]));}
+function localDate(ms){const p=parts(ms);return `${p.year}-${String(p.month).padStart(2,'0')}-${String(p.day).padStart(2,'0')}`;}
+function dateAt(k){return new Date(`${k}T12:00:00Z`);}
+function addDays(k,n){const d=dateAt(k);d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);}
+function occurs(e,k){
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(e.date||'')||k<e.date||e.until&&k>e.until||Array.isArray(e.skip)&&e.skip.includes(k))return false;
+ if(k===e.date)return true;
+ const a=dateAt(e.date),b=dateAt(k),dow=b.getUTCDay();
+ switch(e.repeat||'none'){
+ case 'daily':return true;
+ case 'weekdays':return dow>0&&dow<6;
+ case 'weekly':return Array.isArray(e.repeatDays)&&e.repeatDays.length?e.repeatDays.map(Number).includes(dow):dow===a.getUTCDay();
+ case 'monthly':return b.getUTCDate()===a.getUTCDate();
+ case 'yearly':return b.getUTCMonth()===a.getUTCMonth()&&b.getUTCDate()===a.getUTCDate();
+ default:return false;
+ }
 }
-
-// Authenticate with temporary Google Cloud credentials.
-// No permanent Firebase service-account JSON key is needed.
-admin.initializeApp({
-  credential: admin.credential.applicationDefault(),
-  projectId: 'pocket-docket-82820'
-});
-
-const db = admin.firestore();
-
-webpush.setVapidDetails(
-  process.env.VAPID_SUBJECT,
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY
-);
-
-const now = Date.now();
-const WINDOW_MS = 12 * 60 * 1000;
-const HORIZON_MS = 5 * 60 * 1000;
-
-const subs = await db
-  .collection('pushSubscriptions')
-  .where('enabled', '==', true)
-  .get();
-
-const households = new Map();
-let sent = 0;
-
-for (const subDoc of subs.docs) {
-  const sub = subDoc.data();
-
-  if (!sub.subscription?.endpoint || !sub.householdId || !sub.uid) {
-    continue;
-  }
-
-  // Verify the subscriber still belongs to the household.
-  const member = await db
-    .doc(`households/${sub.householdId}/members/${sub.uid}`)
-    .get();
-
-  if (!member.exists) {
-    continue;
-  }
-
-  // Cache household events to avoid unnecessary repeated reads.
-  if (!households.has(sub.householdId)) {
-    const events = await db
-      .collection('households')
-      .doc(sub.householdId)
-      .collection('events')
-      .get();
-
-    households.set(sub.householdId, events);
-  }
-
-  for (const doc of households.get(sub.householdId).docs) {
-    const e = doc.data();
-
-    if (!Array.isArray(e.who) || !e.time) {
-      continue;
-    }
-
-    // Match the account or linked household member profile.
-    const mine = new Set([sub.uid]);
-    const m = member.data();
-
-    if (m.accountId) mine.add(m.accountId);
-    if (m.id) mine.add(m.id);
-
-    if (!e.who.some(w => mine.has(w))) {
-      continue;
-    }
-
-    const reminders = Array.isArray(e.reminders)
-      ? e.reminders
-      : e.remind !== undefined && e.remind !== ''
-        ? [e.remind]
-        : [];
-
-    // Currently supports only one-time events.
-    // Recurring events need separate handling.
-    if (!e.date || (e.repeat && e.repeat !== 'none')) {
-      continue;
-    }
-
-    const time = String(e.time);
-
-    if (!/^\d{2}:\d{2}$/.test(time)) {
-      continue;
-    }
-
-    // Only explicitly UTC events are supported for now.
-    // Never guess the user's local timezone.
-    const timezone = e.timezone || 'UTC';
-
-    if (timezone !== 'UTC') {
-      continue;
-    }
-
-    const eventAt = Date.parse(`${e.date}T${time}:00Z`);
-
-    if (!Number.isFinite(eventAt)) {
-      continue;
-    }
-
-    for (const minutes of reminders) {
-      const offset = Number(minutes);
-
-      if (!Number.isFinite(offset) || offset < 0) {
-        continue;
-      }
-
-      const due = eventAt - offset * 60000;
-
-      if (due > now + HORIZON_MS || due < now - WINDOW_MS) {
-        continue;
-      }
-
-      // Generate a unique delivery identifier.
-      const digest = crypto
-        .createHash('sha256')
-        .update([
-          subDoc.id,
-          doc.id,
-          e.date,
-          time,
-          offset
-        ].join('|'))
-        .digest('hex');
-
-      const claim = db.collection('pushDeliveryClaims').doc(digest);
-
-      // Prevent duplicate reminder deliveries.
-      try {
-        await db.runTransaction(async tx => {
-          const existing = await tx.get(claim);
-
-          if (existing.exists) {
-            throw new Error('ALREADY_CLAIMED');
-          }
-
-          tx.create(claim, {
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            subscriptionId: subDoc.id,
-            eventId: doc.id
-          });
-        });
-      } catch (err) {
-        if (err.message === 'ALREADY_CLAIMED') {
-          continue;
-        }
-
-        throw err;
-      }
-
-      // Send the push notification.
-      try {
-        await webpush.sendNotification(
-          sub.subscription,
-          JSON.stringify({
-            title: String(e.title || 'Pocket Docket reminder').slice(0, 100),
-            body: offset
-              ? `Starts in ${offset} minutes`
-              : 'Starts now',
-            tag: digest
-          }),
-          {
-            TTL: 3600
-          }
-        );
-
-        sent++;
-      } catch (err) {
-        console.error(
-          'Push delivery error',
-          err.statusCode || err.message
-        );
-
-        // Remove expired or invalid push subscriptions.
-        if ([404, 410].includes(err.statusCode)) {
-          await subDoc.ref.delete();
-        }
-      }
-    }
-  }
+// Find real UTC instants matching a New York wall-clock time. DST gaps yield none;
+// fall-back ambiguous times use the first occurrence, to avoid double reminders.
+function instant(k,time){
+ const [h,m]=time.split(':').map(Number);if(!/^\d{2}:\d{2}$/.test(time)||h>23||m>59)return null;
+ const nominal=Date.parse(`${k}T${time}:00Z`);if(!Number.isFinite(nominal))return null;
+ const matches=[];
+ for(let offset=-5;offset<=5;offset++){
+   const t=nominal+offset*3600_000,p=parts(t);
+   if(localDate(t)===k&&p.hour===h&&p.minute===m)matches.push(t);
+ }
+ return matches.length?Math.min(...matches):null;
 }
+function reminders(e){return (Array.isArray(e.reminders)?e.reminders:(e.remind!==''&&e.remind!=null?[e.remind]:[])).map(Number).filter(n=>Number.isFinite(n)&&n>=0&&n<=10080);}
+function recipientIds(member,uid){return new Set([uid,member?.id,member?.accountId,member?.userId].filter(Boolean));}
+function eligible(e,ids){return Array.isArray(e.who)&&e.who.some(w=>ids.has(w));}
+function safeReason(error){let reason='unknown';try{reason=JSON.parse(error.body||'{}').reason||reason;}catch{}return reason;}
 
-console.log(
-  `Sent ${sent} reminder(s) from ${subs.size} subscription(s).`
-);
+if(!DRY_RUN){for(const key of ['VAPID_PUBLIC_KEY','VAPID_PRIVATE_KEY','VAPID_SUBJECT'])if(!process.env[key])throw Error(`Missing ${key}`);
+ webpush.setVapidDetails(process.env.VAPID_SUBJECT,process.env.VAPID_PUBLIC_KEY,process.env.VAPID_PRIVATE_KEY);}
+admin.initializeApp({credential:admin.credential.applicationDefault(),projectId:'pocket-docket-82820'});
+const db=admin.firestore();
+const subscriptions=await db.collection('pushSubscriptions').where('enabled','==',true).get();
+const householdCache=new Map();
+let dueCount=0,sent=0,failed=0,skipped=0;
+for(const subDoc of subscriptions.docs){
+ const sub=subDoc.data();if(!sub.subscription?.endpoint||!sub.uid||!sub.householdId){skipped++;continue;}
+ const memberDoc=await db.doc(`households/${sub.householdId}/members/${sub.uid}`).get();
+ if(!memberDoc.exists){skipped++;continue;}
+ if(!householdCache.has(sub.householdId))householdCache.set(sub.householdId,await db.collection('households').doc(sub.householdId).collection('events').get());
+ const ids=recipientIds(memberDoc.data(),sub.uid);
+ for(const eventDoc of householdCache.get(sub.householdId).docs){
+  const e=eventDoc.data();if(!eligible(e,ids)||!e.time||!e.date)continue;
+  const offsets=reminders(e);if(!offsets.length)continue;
+  // A reminder may fall up to seven days before the event.
+  const today=localDate(NOW);
+  for(let d= -1;d<=8;d++){
+   const day=addDays(today,d);if(!occurs(e,day))continue;
+   const start=instant(day,String(e.time));if(start===null)continue;
+   for(const offset of new Set(offsets)){
+    const due=start-offset*60_000;
+    if(due>NOW+LOOKAHEAD_MS||due<NOW-LOOKBACK_MS)continue;
+    const id=crypto.createHash('sha256').update([subDoc.id,eventDoc.id,day,e.time,offset].join('|')).digest('hex');
+    const ref=db.collection('pushDeliveryClaims').doc(id);
+    dueCount++;
+    if(DRY_RUN){console.log(`DRY RUN: due reminder event=${eventDoc.id} date=${day} offset=${offset}m`);continue;}
+    const claimed=await db.runTransaction(async tx=>{
+      const snap=await tx.get(ref);const old=snap.data();
+      if(old?.status==='sent'||old?.status==='sending'&&old.leaseUntil?.toMillis()>Date.now())return false;
+      tx.set(ref,{status:'sending',leaseUntil:admin.firestore.Timestamp.fromMillis(Date.now()+LEASE_MS),subscriptionId:subDoc.id,eventId:eventDoc.id,occurrenceDate:day,offset,attempts:admin.firestore.FieldValue.increment(1),updatedAt:admin.firestore.FieldValue.serverTimestamp()},{merge:true});return true;
+    });
+    if(!claimed)continue;
+    try{
+      await webpush.sendNotification(sub.subscription,JSON.stringify({title:String(e.title||'Pocket Docket reminder').slice(0,100),body:offset?`Starts in ${offset} minutes`:'Starts now',tag:id}),{TTL:3600});
+      await ref.set({status:'sent',sentAt:admin.firestore.FieldValue.serverTimestamp(),leaseUntil:admin.firestore.Timestamp.fromMillis(0)},{merge:true});sent++;
+    }catch(err){failed++;console.error(`Push error status=${err.statusCode||'unknown'} reason=${safeReason(err)}`);
+      if([404,410].includes(err.statusCode))await subDoc.ref.update({enabled:false});
+      await ref.set({status:'failed',lastErrorCode:err.statusCode||null,updatedAt:admin.firestore.FieldValue.serverTimestamp(),leaseUntil:admin.firestore.Timestamp.fromMillis(0)},{merge:true});
+    }
+   }
+  }
+ }
+}
+console.log(`Mode=${DRY_RUN?'DRY_RUN':'LIVE'} subscriptions=${subscriptions.size} due=${dueCount} sent=${sent} failed=${failed} skipped=${skipped}`);
+if(failed)process.exitCode=1;

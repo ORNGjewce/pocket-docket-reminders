@@ -1,4 +1,4 @@
-
+import { createECDH } from 'node:crypto';
 import admin from 'firebase-admin';
 import webpush from 'web-push';
 
@@ -22,7 +22,25 @@ admin.initializeApp({
   credential: admin.credential.applicationDefault(),
   projectId: 'pocket-docket-82820'
 });
+import { createECDH } from 'node:crypto';
 
+const ecdh = createECDH('prime256v1');
+ecdh.setPrivateKey(
+  Buffer.from(process.env.VAPID_PRIVATE_KEY, 'base64url')
+);
+
+const derivedPublicKey = ecdh.getPublicKey().toString('base64url');
+
+if (derivedPublicKey !== process.env.VAPID_PUBLIC_KEY) {
+  throw new Error('VAPID public and private keys DO NOT MATCH');
+}
+
+if (!/^(mailto:|https:\/\/)/.test(process.env.VAPID_SUBJECT)) {
+  throw new Error('VAPID_SUBJECT must begin with mailto: or https://');
+}
+
+console.log('VAPID key pair matches.');
+console.log('VAPID subject format is valid.');
 webpush.setVapidDetails(
   process.env.VAPID_SUBJECT,
   process.env.VAPID_PUBLIC_KEY,
